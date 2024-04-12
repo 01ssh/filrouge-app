@@ -1,0 +1,8 @@
+{{- with .Values.namespaces}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces }}
+  labels:
+    name: {{ .Values.namespaces }}
+{{- end }}

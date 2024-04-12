@@ -1,0 +1,191 @@
+image: gcr.io/kaniko-project/executor:v1.14.0-debug
+variables:
+  CI_DEBUG_TRACE: "false"
+  FR_REPO_NAME: toolset
+  FR_DOCKER_COMMIT_TAG: latest
+  FR_ORGANISATION: solcomputing
+  FR_REGION: "eu-west-3"
+  FR_REGISTRY_IMAGE: "docker.io/awswordpressfilrouge/toolset"
+  REPO_URL: "${CI_SERVER_URL}/api/v4/projects/56399840/packages/helm/api/stable/charts"
+workflow:
+  rules:
+    - if: '$CI_COMMIT_REF_NAME'
+stages:
+  - ecr
+  - build-and-push-image
+  - helm-run
+  - deploy-code
+  - update-dns
+  - helm-push-to-repo
+  
+
+01-ecr-create-creds:
+  stage: ecr
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+   - |
+     python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && source ~/.bashrc
+     export PATH=$PATH:~/.local/bin
+     export FR_REGISTRY="$(~/.local/bin/aws sts get-caller-identity | jq -r .Account | tr -d '\n').dkr.ecr.${FR_REGION}.amazonaws.com/${FR_REPO_NAME}"
+     export ECR_PASSWORD=$(~/.local/bin/aws ecr get-login-password  --region ${FR_REGION})
+     export GENERATED_AUTH_CHAIN=$(echo -n "AWS:${ECR_PASSWORD}" | base64)
+     echo   DOCKER_AUTH_CONFIG=$(echo "{'auths': {'${CI_REGISTRY}': {'auth': '${GENERATED_AUTH_CHAIN}'}}}") > auth.env
+     aws eks update-kubeconfig --region ${FR_REGION} --name CLUSTER-WORDPRESS-${CI_COMMIT_REF_NAME}
+     kubectl delete secret node-secrets-web -n ${CI_COMMIT_REF_NAME} || echo "kubectl delete secret node-secrets-web failed $?"
+     kubectl create secret docker-registry node-secrets-web -n ${CI_COMMIT_REF_NAME}  \
+         --docker-server=${FR_REGISTRY} \
+         --docker-username=AWS \
+         --docker-password=${ECR_PASSWORD}
+     kubectl delete secret node-secrets-php-fpm -n ${CI_COMMIT_REF_NAME} || echo "kubectl delete secret node-secrets-php-fpm failed $?" 
+     kubectl create secret docker-registry node-secrets-php-fpm -n ${CI_COMMIT_REF_NAME}  \
+         --docker-server=${FR_REGISTRY} \
+         --docker-username=AWS \
+         --docker-password=${ECR_PASSWORD}
+  artifacts:
+    paths:
+       - auth.env
+
+02-build-nginx:
+  stage: build-and-push-image
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+    - |
+      python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && cat ~/.bashrc && source ~/.bashrc
+      export CI_REGISTRY="$(aws sts get-caller-identity | jq -r .Account | tr -d '\n').dkr.ecr.${FR_REGION}.amazonaws.com/web"
+       /kaniko/executor \
+      --context "${CI_PROJECT_DIR}/app/nginx" \
+      --dockerfile "${CI_PROJECT_DIR}/app/nginx/Dockerfile" \
+                       --build-arg  AWS_DEFAULT_REGION=$FR_REGION \
+                       --build-arg  AWS_REGION=$FR_REGION \
+                       --build-arg  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+                       --build-arg  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+                       --destination  "${CI_REGISTRY}:${FR_DOCKER_COMMIT_TAG}" \
+                       --skip-tls-verify 2>&1 > /dev/null
+                       
+  rules:
+    - if: $CI_COMMIT_REF_NAME
+
+03-build-php-fpm:
+  stage: build-and-push-image
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+    - |
+      python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && source ~/.bashrc
+      export CI_REGISTRY="$(aws sts get-caller-identity | jq -r .Account | tr -d '\n').dkr.ecr.${FR_REGION}.amazonaws.com/php-fpm"
+      if [[ "`aws ecr list-images --repository-name php-fpm 2>&1  | jq -r '.imageIds[].imageTag' | grep -v null | tr -d '\n'`" != "latest" ]]; then
+         /kaniko/executor --context "${CI_PROJECT_DIR}/app/php-fpm" \
+         --dockerfile "${CI_PROJECT_DIR}/app/php-fpm/Dockerfile" \
+         --build-arg  AWS_DEFAULT_REGION=$FR_REGION \
+         --build-arg  AWS_REGION=$FR_REGION \
+         --build-arg  AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+         --build-arg  AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+         --destination  "${CI_REGISTRY}:${FR_DOCKER_COMMIT_TAG}" \
+         --skip-tls-verify 2>&1 > /dev/null
+      fi
+  rules:
+    - if: $CI_COMMIT_REF_NAME
+  needs:
+    - 02-build-nginx
+
+
+04-helm-deploy-volume:
+  stage: helm-run
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+    - |
+      echo "HELM DEPLOY aws-wordpress-volume"
+      python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && source ~/.bashrc
+      aws ecr get-login-password \
+      --region ${FR_REGION} | helm registry login \
+      --username AWS \
+      --password-stdin $(aws sts get-caller-identity | jq -r .Account | tr -d '\n').dkr.ecr.${FR_REGION}.amazonaws.com
+      aws eks update-kubeconfig --region ${FR_REGION} --name CLUSTER-WORDPRESS-${CI_COMMIT_REF_NAME}
+      helm upgrade -i aws-wordpress-volume charts/aws-wordpress-volume/ --set image.repository=$(aws sts get-caller-identity | jq -r .Account).dkr.ecr.${FR_REGION}.amazonaws.com/php-fpm --namespace ${CI_COMMIT_REF_NAME} --values ./charts/aws-wordpress-volume/${CI_COMMIT_REF_NAME}/values.yaml
+  needs: [ "02-build-nginx", "03-build-php-fpm" ]
+
+05-helm-deploy-php-fpm:
+  stage: helm-run
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+    - |
+      echo "HELM DEPLOY aws-wordpress-php-fpm"
+      python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && source ~/.bashrc
+      aws ecr get-login-password \
+      --region ${FR_REGION} | helm registry login \
+      --username AWS \
+      --password-stdin $(aws sts get-caller-identity | jq -r .Account | tr -d '\n').dkr.ecr.${FR_REGION}.amazonaws.com
+      aws eks update-kubeconfig --region ${FR_REGION} --name CLUSTER-WORDPRESS-${CI_COMMIT_REF_NAME}
+      helm upgrade -i aws-wordpress-php-fpm charts/aws-wordpress-php-fpm/ --set image.repository=$(aws sts get-caller-identity | jq -r .Account).dkr.ecr.${FR_REGION}.amazonaws.com/php-fpm --namespace ${CI_COMMIT_REF_NAME} --values ./charts/aws-wordpress-php-fpm/${CI_COMMIT_REF_NAME}/values.yaml
+  needs: [ "02-build-nginx", "03-build-php-fpm" ]
+
+06-helm-deploy-frontend:
+  stage: helm-run
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+    - |
+      echo "HELM DEPLOY aws-wordpress-frontend"
+      python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && source ~/.bashrc
+      aws ecr get-login-password \
+      --region ${FR_REGION} | helm registry login \
+      --username AWS \
+      --password-stdin $(aws sts get-caller-identity | jq -r .Account | tr -d '\n').dkr.ecr.${FR_REGION}.amazonaws.com
+      aws eks update-kubeconfig --region ${FR_REGION} --name CLUSTER-WORDPRESS-${CI_COMMIT_REF_NAME}
+      helm upgrade -i aws-wordpress-web charts/aws-wordpress-web/ --set image.repository=$(aws sts get-caller-identity | jq -r .Account).dkr.ecr.${FR_REGION}.amazonaws.com/web --namespace ${CI_COMMIT_REF_NAME} --values ./charts/aws-wordpress-web/${CI_COMMIT_REF_NAME}/values.yaml
+  needs: [ "05-helm-deploy-php-fpm" ]
+
+07-deploy-app-code:
+  stage: deploy-code
+  environment:
+    name: "${CI_COMMIT_REF_NAME}"
+  image:
+    name: "${FR_REGISTRY_IMAGE}:${FR_DOCKER_COMMIT_TAG}"
+    entrypoint: [""]
+  script:
+    - |
+      python ./tools/aws-configure.py -a ${CICD_VAULT_TOKEN_ADDR} -v ${CICD_VAULT_TOKEN} -e ${CI_COMMIT_REF_NAME} -p aws/${ACCOUNT}_administrators -r ${FR_REGION} -u ${ACCOUNT} && source ~/.bashrc
+      cat ~/.bashrc
+      chmod 755 ./tools/deploy.sh
+      ./tools/deploy.sh -c "${CI_COMMIT_REF_NAME}"
+  needs: [ 05-helm-deploy-php-fpm, 06-helm-deploy-frontend ]
+
+
+08-route53:
+  stage: update-dns
+  trigger:
+    project: aws-solcomputing/filrouge-route53
+    branch: ${CI_COMMIT_BRANCH}
+  needs: ["04-helm-deploy-volume", 
+          "05-helm-deploy-php-fpm",
+          "06-helm-deploy-frontend" 
+          ]
+  when: on_success
+
+
+09-helm-build-charts:
+  stage: helm-push-to-repo
+  trigger:
+    project: aws-solcomputing/filrouge-helm

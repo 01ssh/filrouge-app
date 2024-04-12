@@ -1,0 +1,11 @@
+namespace: production
+volumeRessource:
+  - name: wordpress-volume-pv
+    namespace: production
+    path: /var/www/html
+    accessModes: ReadWriteMany
+    capacity: 5Gi
+    persistentVolumeClaim:
+       accessModes: ReadWriteMany
+       claimName: wordpress-volume-pvc
+       capacity: 5Gi
